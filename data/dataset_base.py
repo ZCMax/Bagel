@@ -136,6 +136,13 @@ class PackedDataset(torch.utils.data.IterableDataset):
                     else:
                         dataset_args['jsonl_path_list'].append(meta_info['jsonl_path'])
 
+                if 'json_path' in meta_info.keys():
+                    # jsonl with jpeg
+                    if 'json_path_list' not in dataset_args.keys():
+                        dataset_args['json_path_list'] = [meta_info['json_path']]
+                    else:
+                        dataset_args['json_path_list'].append(meta_info['json_path'])
+
             resume_data_status = dataset_args.pop('resume_data_status', True)
             if data_status is not None and grouped_dataset_name in data_status.keys() and resume_data_status:
                 data_status_per_group = data_status[grouped_dataset_name]
