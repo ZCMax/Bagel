@@ -298,8 +298,15 @@ class InterleaveInferencer:
             return output_dict
 
         input_list = []
+        # --- 修改开始: 支持图片列表 ---
         if image is not None:
-            input_list.append(image)
+            if isinstance(image, list):
+                # 如果是列表，将所有图片按顺序加入
+                input_list.extend(image)
+            else:
+                # 如果是单张图片，直接加入
+                input_list.append(image)
+        # --- 修改结束 ---
         if text is not None:
             input_list.append(text)
 
