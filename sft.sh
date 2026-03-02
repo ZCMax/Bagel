@@ -27,7 +27,7 @@ torchrun \
   --finetune-from-ema True \
   --log_every 1 \
   --lr 2e-5 \
-  --num_worker 1 \
+  --num_workers 1 \
   --expected_num_tokens 10240 \
   --max_num_tokens 11520 \
   --max_num_tokens_per_sample 10240 \

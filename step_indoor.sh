@@ -11,7 +11,7 @@ MASTER_PORT=29500
 # 3. 启动命令
 
 
-srun -p efm_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quotatype=reserved apptainer exec --nv  --bind /mnt:/mnt /mnt/inspurfs/mozi_t/linjingli/apptainer/mllm3r.sif \
+srun -p mozi_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quotatype=reserved apptainer exec --nv  --bind /mnt:/mnt /mnt/inspurfs/mozi_t/linjingli/apptainer/mllm3r.sif \
     bash -c 'torchrun \
       --nnodes=1 \
       --node_rank=0 \
@@ -19,19 +19,19 @@ srun -p efm_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quot
       --master_addr="127.0.0.1" \
       --master_port=29533 \
       train/pretrain_unified_navit.py \
-      --dataset_config_file ./data/configs/si_example.yaml \
+      --dataset_config_file ./data/configs/step_indoor.yaml \
       --model_path /mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT \
       --layer_module Qwen2MoTDecoderLayer \
       --max_latent_size 64 \
-      --total_steps 5000 \
+      --total_steps 30000 \
       --resume-from /mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT \
       --finetune_from_hf True \
       --auto_resume True \
       --resume-model-only True \
       --finetune-from-ema True \
       --log_every 1 \
-      --results_dir /mnt/inspurfs/mozi_t/linjingli/bagel/models/si0122 \
-      --checkpoint_dir /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints/si0122 \
+      --results_dir /mnt/inspurfs/mozi_t/linjingli/bagel/models/step_indoor0211 \
+      --checkpoint_dir /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints/step_indoor0211 \
       --lr 2e-5 \
       --visual_und False \
       --num_workers 1 \
