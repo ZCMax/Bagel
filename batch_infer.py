@@ -138,6 +138,7 @@ def main():
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=os.path.join(model_path, "ema_merged.safetensors"),
+            # checkpoint=os.path.join(model_path, "ema.safetensors"),
             device_map=device_map,
             offload_buffers=True,
             offload_folder="offload",
@@ -206,7 +207,17 @@ def main():
     if args.idx>-1:
         val_datas = [val_datas[args.idx]]*args.num
     else:
-        val_datas = random.sample(val_datas,args.num)
+        data_len = len(val_datas)
+        if data_len <= 200:
+            # 1. 小于等于 200 则全测
+            print(f"Dataset size {data_len} <= 200, testing all samples.")
+            # 此时不需要 random.sample
+        else:
+            # 2. 大于 200 则采样
+            # 即使前面有 set_seed，这里再次调用可以确保万无一失
+            # 且保证 val_datas 顺序固定（如果 read_jsonl 结果不确定，建议先 sort）
+            # random.seed(args.seed) 
+            val_datas = random.sample(val_datas, args.num)
     
         
     
