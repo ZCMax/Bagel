@@ -323,11 +323,11 @@
 
 
 ### 13. force_onlyone_step_prompt——scannet
-python batch_infer.py \
-  --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/force_onlyone_step_prompt_scannet_test.jsonl \
-  --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
-  --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/force_onlyone_step_prompt/scannet/step_mix_force0303_0020000 \
-  --model_path   /mnt/inspurfs/efm_t/linjingli/model/bagel_merge/step_mix_force0303_0020000 \
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/force_onlyone_step_prompt_scannet_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/force_onlyone_step_prompt/scannet/step_mix_force0303_0020000 \
+#   --model_path   /mnt/inspurfs/efm_t/linjingli/model/bagel_merge/step_mix_force0303_0020000 \
 
 
 
@@ -346,3 +346,84 @@ python batch_infer.py \
 #   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
 #   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/force_onlyone_step_prompt/matterport3d/step_mix_force0303_0020000 \
 #   --model_path /mnt/inspurfs/efm_t/linjingli/model/bagel_merge/step_mix_force0303_0020000  \
+
+
+
+
+
+### 1. rule_base_simple_2context——scannet
+python batch_infer.py \
+  --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_scannet_test.jsonl \
+  --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+  --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/scannet/bagel \
+  --model_path /mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT \
+
+
+
+### 2. rule_base_simple_2context——dl3dv
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_dl3dv_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/dl3dv/bagel \
+#   --model_path /mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT \
+
+
+
+### 3. rule_base_simple_2context——matterport3d
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_matterport3d_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/matterport3d/bagel \
+#   --model_path /mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT \
+
+
+# ## 4. rule_base_simple_2context——scannet——dropout
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_scannet_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/scannet/rule_base_simple_2context_3data_0306_0015000 \
+#   --model_path /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/rule_base_simple_2context_3data_0306_0015000 \
+
+
+
+# ## 5. rule_base_simple_2context——dl3dv——dropout
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_dl3dv_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/dl3dv/rule_base_simple_2context_3data_0306_0015000 \
+#   --model_path /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/rule_base_simple_2context_3data_0306_0015000 \
+
+
+
+# ## 6. rule_base_simple_2context——matterport3d——dropout
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_matterport3d_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/matterport3d/rule_base_simple_2context_3data_0306_0015000 \
+#   --model_path /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/rule_base_simple_2context_3data_0306_0015000 \
+
+
+# ## 7. rule_base_simple_2context——scannet——nodropout
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_scannet_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/scannet/rule_base_simple_2context_3data_0308_0015000 \
+#   --model_path /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/rule_base_simple_2context_3data_0308_0015000 \
+
+
+
+# ## 8. rule_base_simple_2context——dl3dv——nodropout
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_dl3dv_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/dl3dv/rule_base_simple_2context_3data_0308_0015000 \
+#   --model_path /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/rule_base_simple_2context_3data_0308_0015000 \
+
+
+
+# ## 9. rule_base_simple_2context——matterport3d——nodropout
+# python batch_infer.py \
+#   --eval-json /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_matterport3d_test.jsonl \
+#   --image-root /mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data \
+#   --out-dir /mnt/inspurfs/efm_t/longyilin/genspace/outputs/rule_base_simple_2context/matterport3d/rule_base_simple_2context_3data_0308_0015000 \
+#   --model_path /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/rule_base_simple_2context_3data_0308_0015000  \

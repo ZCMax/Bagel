@@ -5,8 +5,10 @@ import csv
 import torch
 import numpy as np
 import glob
+import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+import textwrap
 from scipy.spatial.transform import Rotation as R_scipy
 import kornia as K
 from kornia.feature import LoFTR
@@ -15,12 +17,13 @@ from kornia.feature import LoFTR
 # 1. 基础配置
 # ==========================================
 BASE_CONFIG = {
-    "META_JSONL": "/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/meta_scannet_test.jsonl",
+    "TEST_JSONL": "/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/annos/rule_base_simple_2context_scannet_test.jsonl",
+    "PRED_JSON": "",
     "INFO_DIR": "/mnt/inspurfs/mozi_t/linjingli/mmscan/embodiedscan_info",
     "IMAGE_ROOT": "/mnt/inspurfs/mozi_t/linjingli/transfer/ScanNet_v2",
     "THRESH_ZERO_TRANS": 0.5,   
     "THRESH_ZERO_ROT": 15.0,    
-    "ALPHA_NON_ZERO": 0.3       
+    # "ALPHA_NON_ZERO": 0.3       
 }
 
 BASE_OUTPUTS_DIR = "/mnt/inspurfs/efm_t/longyilin/genspace/outputs"
@@ -78,12 +81,14 @@ class SpatialLoFTREvaluator:
             return raw_angle
 
         center_src, forward_src = pose_src[:3, 3], pose_src[:3, 2]
-        dir_src = forward_src[:2] / np.linalg.norm(forward_src[:2])
-        pitch_src = np.arcsin(np.abs(forward_src[2]) / np.linalg.norm(forward_src))
+        forward_src_xy_norm = np.linalg.norm(forward_src[:2]) + 1e-8
+        dir_src = forward_src[:2] / forward_src_xy_norm
+        pitch_src = np.arctan2(forward_src[2], forward_src_xy_norm)
 
         center_tgt, forward_tgt = pose_tgt[:3, 3], pose_tgt[:3, 2]
+        forward_tgt_xy_norm = np.linalg.norm(forward_tgt[:2]) + 1e-8
         dir_tgt = forward_tgt[:2] / np.linalg.norm(forward_tgt[:2])
-        pitch_tgt = np.arcsin(np.abs(forward_tgt[2]) / np.linalg.norm(forward_tgt))
+        pitch_tgt = np.arctan2(forward_tgt[2], forward_tgt_xy_norm)
 
         distance = np.linalg.norm(center_tgt[:2] - center_src[:2])
         angle = get_angle(dir_src, center_tgt[:2] - center_src[:2]) if distance > 1e-6 else 0.0
@@ -231,9 +236,16 @@ class SpatialLoFTREvaluator:
         return {"metrics": scores, "joint_pass": joint_pass}
 
     def evaluate_single_item(self, item):
-        from_idx = item["meta"].get("from", -1) 
-        source_rel = item["context"][from_idx]
-        target_rel = item["target"] 
+        # GT 以测试集定义为准：context 最后一张图 -> target 图
+        context_list = item.get("context") or []
+        if len(context_list) == 0:
+            return {"id": item.get("id"), "scene": "Unknown", "status": "data_missing", "error_reason": "测试集样本缺少 context"}
+
+        source_rel = context_list[-1]
+        target_rel = item.get("target")
+        if not target_rel:
+            return {"id": item.get("id"), "scene": "Unknown", "status": "data_missing", "error_reason": "测试集样本缺少 target"}
+
         scene_id = source_rel.split('/')[1] 
 
         meta_scenariodata = self.load_scene_meta(scene_id)
@@ -249,9 +261,12 @@ class SpatialLoFTREvaluator:
             
         pose_src_gl = meta_scenariodata[src_key]['pose']
         pose_tgt_gl = meta_scenariodata[tgt_key]['pose']
-        
-        math_metrics = self.compute_metrics_from_poses(pose_src_gl, pose_tgt_gl)
-        math_scores = self.score_metrics(item["meta"], math_metrics)
+
+        # 以 pose 计算 GT dx/dy/dz/dphi/dangle
+        gt_metrics = self.compute_metrics_from_poses(pose_src_gl, pose_tgt_gl)
+
+        # 纯数学公式自检：同一套公式从 pose 推导，应当完全一致（用于排查数据/实现错误）
+        math_scores = self.score_metrics(gt_metrics, gt_metrics)
 
         # 加载图片
         src_rgb_path, src_depth_path, K_src = self.resolve_paths(source_rel, meta_scenariodata)
@@ -264,6 +279,14 @@ class SpatialLoFTREvaluator:
             return {"id": item["id"], "scene": scene_id, "status": "pred_missing", "error_reason": f"预测图片未生成: {eval_img_path}", "math_scores": math_scores}
         if not tgt_gt_rgb_path or not os.path.exists(tgt_gt_rgb_path):
             return {"id": item["id"], "scene": scene_id, "status": "gt_target_missing", "error_reason": f"真值目标图丢失: {tgt_gt_rgb_path}", "math_scores": math_scores}
+
+        vis_data = {
+            "context_paths": item.get("context", []),
+            "context_abs_path": src_rgb_path,
+            "target_path": tgt_gt_rgb_path,
+            "pred_path": eval_img_path,
+            "instruction": item.get("instruction", item.get("prompt", "N/A")),
+        }
 
         img_src = cv2.imread(src_rgb_path)
         img_tgt_gt = cv2.imread(tgt_gt_rgb_path) 
@@ -280,7 +303,7 @@ class SpatialLoFTREvaluator:
         if gt_pnp_metrics is None:
             gt_pnp_scores = {"joint_pass": False, "pnp_failed": True, "error": gt_pnp_error}
         else:
-            gt_pnp_scores = self.score_metrics(item["meta"], gt_pnp_metrics)
+            gt_pnp_scores = self.score_metrics(gt_metrics, gt_pnp_metrics)
             gt_pnp_scores["pnp_failed"] = False
 
         # 3. 模型预测评估 (用生成图跑)
@@ -291,17 +314,109 @@ class SpatialLoFTREvaluator:
                 "id": item["id"], "scene": scene_id, "status": "pred_pnp_failed", 
                 "error_reason": f"生成图PnP失败: {pred_pnp_error}", 
                 "math_scores": math_scores, 
-                "gt_pnp_scores": gt_pnp_scores
+                "gt_pnp_scores": gt_pnp_scores,
+                "gt_metrics": gt_metrics,
+                "vis_data": vis_data,
             }
             
-        pred_scores = self.score_metrics(item["meta"], est_metrics)
+        pred_scores = self.score_metrics(gt_metrics, est_metrics)
             
         return {
             "id": item["id"], "scene": scene_id, "status": "success", 
             "math_scores": math_scores, 
             "gt_pnp_scores": gt_pnp_scores,
-            "pred_scores": pred_scores
+            "pred_scores": pred_scores,
+            "gt_metrics": gt_metrics,
+            "vis_data": vis_data,
         }
+
+
+def visualize_failed_cases(all_results, prompt_type, model_name, output_dir, num_cases=10):
+    vis_dir = os.path.join(output_dir, f"vis_failures_{prompt_type}_{model_name}")
+    failed_items = []
+    for res in all_results:
+        if "vis_data" not in res:
+            continue
+        is_pnp_failed = (res["status"] == "pred_pnp_failed")
+        is_metric_failed = (res["status"] == "success" and not res["pred_scores"]["joint_pass"])
+        if is_pnp_failed or is_metric_failed:
+            failed_items.append(res)
+
+    if not failed_items:
+        return
+
+    os.makedirs(vis_dir, exist_ok=True)
+    sampled_fails = random.sample(failed_items, min(num_cases, len(failed_items)))
+
+    for res in sampled_fails:
+        vis_data = res["vis_data"]
+        context_paths = vis_data.get("context_paths", [])
+        context_imgs = []
+        for idx, cp in enumerate(context_paths):
+            path = vis_data["context_abs_path"] if idx == len(context_paths) - 1 else None
+            img = cv2.imread(path) if path and os.path.exists(path) else None
+            if img is None:
+                img = np.zeros((240, 320, 3), dtype=np.uint8)
+            else:
+                img = cv2.resize(img, (320, 240))
+            context_imgs.append(img)
+        if not context_imgs:
+            context_imgs = [np.zeros((240, 320, 3), dtype=np.uint8)]
+
+        tgt_img = cv2.imread(vis_data["target_path"]) if os.path.exists(vis_data["target_path"]) else None
+        tgt_img = cv2.resize(tgt_img, (320, 240)) if tgt_img is not None else np.zeros((240, 320, 3), dtype=np.uint8)
+
+        pred_path = vis_data.get("pred_path")
+        pred_img = cv2.imread(pred_path) if pred_path and os.path.exists(pred_path) else None
+        pred_img = cv2.resize(pred_img, (320, 240)) if pred_img is not None else np.zeros((240, 320, 3), dtype=np.uint8)
+
+        row1_w = len(context_imgs) * 320
+        canvas_w = max(row1_w, 640, 800)
+        canvas_h = 240 + 240 + 260
+        canvas = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 255
+
+        x_offset = 0
+        for i, img in enumerate(context_imgs):
+            canvas[0:240, x_offset:x_offset + 320] = img
+            cv2.putText(canvas, f"Context {i+1}", (x_offset + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            x_offset += 320
+
+        canvas[240:480, 0:320] = tgt_img
+        cv2.putText(canvas, "Target (GT)", (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+        canvas[240:480, 320:640] = pred_img
+        cv2.putText(canvas, "Generated (Pred)", (330, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+        gt_from_scores = res.get("pred_scores", {}).get("metrics", {})
+        gt_from_pose = res.get("gt_metrics", {})
+        gt_dx = gt_from_scores.get("dx", {}).get("gt", gt_from_pose.get("dx", 0.0))
+        gt_dy = gt_from_scores.get("dy", {}).get("gt", gt_from_pose.get("dy", 0.0))
+        gt_dz = gt_from_scores.get("dz", {}).get("gt", gt_from_pose.get("dz", 0.0))
+        gt_dphi = gt_from_scores.get("dphi", {}).get("gt", gt_from_pose.get("dphi", 0.0))
+        gt_dangle = gt_from_scores.get("dangle", {}).get("gt", gt_from_pose.get("dangle", 0.0))
+
+        pred_metrics = res.get("pred_scores", {}).get("metrics", {})
+        p_dx = pred_metrics.get("dx", {}).get("pred", "N/A") if pred_metrics else "N/A"
+        p_dy = pred_metrics.get("dy", {}).get("pred", "N/A") if pred_metrics else "N/A"
+        p_dz = pred_metrics.get("dz", {}).get("pred", "N/A") if pred_metrics else "N/A"
+        p_dphi = pred_metrics.get("dphi", {}).get("pred", "N/A") if pred_metrics else "N/A"
+        p_dangle = pred_metrics.get("dangle", {}).get("pred", "N/A") if pred_metrics else "N/A"
+
+        instruction = vis_data.get("instruction", "N/A")
+        wrapped_inst = textwrap.wrap(f"Instruction: {instruction}", width=100)
+        text_lines = [f"ID: {res.get('id', 'Unknown')} | Status: {res['status']} | Error: {res.get('error_reason', 'N/A')}"]
+        text_lines.extend(wrapped_inst)
+        text_lines.extend([
+            "-" * 80,
+            f"[GT]   dx: {gt_dx:.3f}, dy: {gt_dy:.3f}, dz: {gt_dz:.3f}, dphi: {gt_dphi:.3f}, dangle: {gt_dangle:.3f}",
+            f"[Pred] dx: {p_dx if isinstance(p_dx, str) else f'{p_dx:.3f}'}, dy: {p_dy if isinstance(p_dy, str) else f'{p_dy:.3f}'}, dz: {p_dz if isinstance(p_dz, str) else f'{p_dz:.3f}'}, dphi: {p_dphi if isinstance(p_dphi, str) else f'{p_dphi:.3f}'}, dangle: {p_dangle if isinstance(p_dangle, str) else f'{p_dangle:.3f}'}",
+        ])
+
+        y0 = 510
+        for i, line in enumerate(text_lines):
+            cv2.putText(canvas, line, (15, y0 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+
+        save_path = os.path.join(vis_dir, f"fail_id_{res.get('id', 'Unknown')}.jpg")
+        cv2.imwrite(save_path, canvas)
 
 # ==========================================
 # 3. 结果保存与返回
@@ -446,24 +561,43 @@ def evaluate_experiment(pred_json_path, base_config):
     config = base_config.copy()
     config["PRED_JSON"] = pred_json_path
     
-    meta_dict = {}
+    # 读取测试集 jsonl：以其中的 context/target 为准（不再读取 meta_jsonl）
+    test_items_by_id = {}
     try:
-        with open(config["META_JSONL"], 'r') as f:
+        with open(config["TEST_JSONL"], 'r') as f:
             for line in f:
                 data = json.loads(line)
-                meta_dict[str(data['id'])] = data['meta']
+                test_items_by_id[str(data["id"])] = {
+                    "id": data.get("id"),
+                    "context": data.get("context"),
+                    "target": data.get("target"),
+                }
     except Exception as e:
-        return {"status": "error", "error_msg": f"读取 Meta 失败: {e}"}
+        return {"status": "error", "error_msg": f"读取测试集 JSONL 失败: {e}"}
 
     items_to_eval = []
     try:
+        pred_ids = set()
         with open(config["PRED_JSON"], 'r') as f:
             predictions = json.load(f)
             for item in predictions:
                 str_id = str(item['id'])
-                if str_id in meta_dict:
-                    item['meta'] = meta_dict[str_id]
-                    items_to_eval.append(item)
+                pred_ids.add(str_id)
+                if str_id not in test_items_by_id:
+                    err_msg = f"❌ 预测结果中存在测试集未定义的 id: {str_id}"
+                    print(err_msg)
+                    return {"status": "error", "error_msg": err_msg}
+                # 用测试集里的 context/target 覆盖（确保 GT 一致）
+                item["context"] = test_items_by_id[str_id].get("context", item.get("context"))
+                item["target"] = test_items_by_id[str_id].get("target", item.get("target"))
+                items_to_eval.append(item)
+        missing_pred_ids = sorted(set(test_items_by_id.keys()) - pred_ids)
+        if missing_pred_ids:
+            preview = ", ".join(missing_pred_ids[:10])
+            suffix = " ..." if len(missing_pred_ids) > 10 else ""
+            err_msg = f"❌ 预测结果缺少测试集 id，共 {len(missing_pred_ids)} 个，示例: {preview}{suffix}"
+            print(err_msg)
+            return {"status": "error", "error_msg": err_msg}
     except Exception as e:
         return {"status": "error", "error_msg": f"读取 Pred JSON 失败: {e}"}
 
@@ -479,6 +613,8 @@ def evaluate_experiment(pred_json_path, base_config):
         all_results.append(res)
         if (i + 1) % 20 == 0:  
             print(f"   ⏳ [{model_name}] 进度: {i+1}/{total_samples}")
+
+    visualize_failed_cases(all_results, prompt_type, model_name, CSV_RESULTS_DIR, num_cases=10)
 
     metrics = save_summary_and_return_metrics(all_results, total_samples, prompt_type, model_name)
     
