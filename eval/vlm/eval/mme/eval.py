@@ -29,8 +29,8 @@ def post_processing(response):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='eval/vlm/eval/mme/Your_Results')
-    parser.add_argument('--out-dir', type=str, default='results')
-    parser.add_argument('--model-path', type=str, default='hf/BAGEL-7B-MoT/')
+    parser.add_argument('--out-dir', type=str, default='results/MME')
+    parser.add_argument('--model-path', type=str, default='/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/idswap_simple_2context_0310_3data_0310_0015000')
     args = parser.parse_args()
 
     model, tokenizer, new_token_ids = load_model_and_tokenizer(args)
@@ -50,11 +50,9 @@ if __name__ == '__main__':
         for line in tqdm(lines):
             img, question, gt = line.strip().split('\t')
             question = question + ' ' + prompt
-            img_path = os.path.join('eval/vlm/data/mme/MME_Benchmark_release_version', filename, img)
+            img_path = os.path.join('/mnt/inspurfs/mozi_t/huwenbo/MME/MME_Benchmark_release_version/MME_Benchmark', filename, img)
             if not os.path.exists(img_path):
-                img_path = os.path.join('eval/vlm/data/mme/MME_Benchmark_release_version', filename, "images", img)
-            if not os.path.exists(img_path):
-                continue
+                img_path = os.path.join('/mnt/inspurfs/mozi_t/huwenbo/MME/MME_Benchmark_release_version/MME_Benchmark', filename, "images", img)
             images = [Image.open(img_path).convert('RGB')]
             images, conversation = process_conversation(images, question)
 
@@ -70,5 +68,3 @@ if __name__ == '__main__':
             print(img, question, gt, response, sep='\t', file=fout)
         fin.close()
         fout.close()
-
-    os.system(f"python -m eval.vlm.eval.mme.calculation --out-dir {args.out_dir}")

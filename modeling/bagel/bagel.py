@@ -122,7 +122,9 @@ class Bagel(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
-        return_images = False
+        return_images = False,
+        return_mse_preds: bool = False,
+        return_mse_targets: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -260,9 +262,14 @@ class Bagel(PreTrainedModel):
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
             
             
-        
+        output_dict = dict(mse=mse, ce=ce)
+        if return_mse_preds and self.config.visual_gen:
+            output_dict["mse_preds"] = packed_mse_preds
+        if return_mse_targets and self.config.visual_gen:
+            output_dict["mse_target_clean"] = packed_latent_clean[has_mse]
+            output_dict["mse_target_noise"] = noise[has_mse]
 
-        return dict(mse=mse, ce=ce),images
+        return output_dict, images
 
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):

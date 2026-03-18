@@ -11,7 +11,7 @@ MASTER_PORT=29500
 # 3. 启动命令
 
 
-srun -p mozi_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quotatype=reserved apptainer exec --nv  --bind /mnt:/mnt /mnt/inspurfs/mozi_t/linjingli/apptainer/mllm3r.sif \
+srun -p efm_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quotatype=reserved apptainer exec --nv  --bind /mnt:/mnt /mnt/inspurfs/mozi_t/linjingli/apptainer/mllm3r.sif \
     bash -c 'torchrun \
       --nnodes=1 \
       --node_rank=0 \
@@ -19,7 +19,7 @@ srun -p mozi_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quo
       --master_addr="127.0.0.1" \
       --master_port=29533 \
       train/pretrain_unified_navit.py \
-      --dataset_config_file ./data/configs/step_mix_refine.yaml \
+      --dataset_config_file ./data/configs/idswap_complex_2context_0310_3data.yaml \
       --model_path /mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT \
       --layer_module Qwen2MoTDecoderLayer \
       --max_latent_size 64 \
@@ -30,8 +30,8 @@ srun -p mozi_t --job-name=train_bagel_8gpu --gres=gpu:8 --ntasks-per-node=1 -quo
       --resume-model-only True \
       --finetune-from-ema True \
       --log_every 1 \
-      --results_dir /mnt/inspurfs/mozi_t/linjingli/bagel/models/step_mix_refine0227 \
-      --checkpoint_dir /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints/step_mix_refine0227 \
+      --results_dir /mnt/inspurfs/mozi_t/linjingli/bagel/models/idswap_complex_2context_0310_3data_0310 \
+      --checkpoint_dir /mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints/idswap_complex_2context_0310_3data_0310 \
       --lr 2e-5 \
       --visual_und False \
       --num_workers 1 \

@@ -3,26 +3,13 @@ import torch
 import numpy as np
 import argparse
 import random
+import re
 from PIL import Image
 from tqdm import tqdm
 import json
 # 移除 gradio
 # import gradio as gr 
-
-from accelerate import infer_auto_device_map, load_checkpoint_and_dispatch, init_empty_weights
-# 如果你在本地没有安装 accelerate，可能需要处理一下，但通常运行大模型是必须的
-
-from data.data_utils import add_special_tokens, pil_img2rgb
-from data.transforms import ImageTransform
-from inferencer import InterleaveInferencer
-from modeling.autoencoder import load_ae
-from modeling.bagel.qwen2_navit import NaiveCache
-from modeling.bagel import (
-    BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM,
-    SiglipVisionConfig, SiglipVisionModel
-)
-from modeling.qwen2 import Qwen2Tokenizer
-from accelerate.utils import BnbQuantizationConfig, load_and_quantize_model
+from data.pose_condition import compose_instruction_with_pose
 
 def get_args():
     parser = argparse.ArgumentParser(description="BAGEL Local Inference with 2 Images")
@@ -30,8 +17,9 @@ def get_args():
     # 模型相关参数
     parser.add_argument("--model_path", type=str, default="/mnt/shared-storage-user/gpfs2-shared-public/huggingface/zskj-hub/models--ByteDance-Seed-BAGEL-7B-MoT", help="Path to the model")
     parser.add_argument("--mode", type=int, default=1, help="1: bf16, 2: nf4, 3: int8")
-    parser.add_argument("--num", type=int, default=200)
+    parser.add_argument("--num", type=int, default=-1, help="Number of samples to run. <=0 means all.")
     parser.add_argument("--idx", type=int, default=-1)
+    parser.add_argument("--random_subset", action="store_true", help="When --num > 0, sample randomly instead of taking the first N.")
     parser.add_argument("--image-root", type=str, default="/mnt/inspurfs/efm_t/huwenbo/hoss_datasets/dl3dv")
     # 输入输出相关参数
     parser.add_argument("--eval-json", type=str, required=True, help="Path to evaluation json file")
@@ -41,6 +29,12 @@ def get_args():
     parser.add_argument("--cfg_text_scale", type=float, default=4.0)
     parser.add_argument("--cfg_img_scale", type=float, default=2.0)
     parser.add_argument("--num_timesteps", type=int, default=50)
+    parser.add_argument("--timestep_shift", type=float, default=3.0, help="Override diffusion timestep_shift. Default uses model config.")
+    parser.add_argument("--cfg_interval_start", type=float, default=0.0)
+    parser.add_argument("--cfg_interval_end", type=float, default=1.0)
+    parser.add_argument("--cfg_renorm_type", type=str, default="text_channel", choices=["global", "channel", "text_channel"])
+    parser.add_argument("--cfg_renorm_min", type=float, default=0.0)
+    parser.add_argument("--text_temperature", type=float, default=0.3)
     parser.add_argument("--show_thinking", action="store_true", help="Enable thinking process output")
     parser.add_argument(
         "--use_vit_cond",
@@ -51,6 +45,32 @@ def get_args():
         "--add_context_role_text",
         action="store_true",
         help="Insert explicit role text ('first image', 'second image') before each context image.",
+    )
+    parser.add_argument(
+        "--inject_pose_text",
+        action="store_true",
+        help="Append pose-matrix condition text from json fields (context_poses/target_pose/start_image_id).",
+    )
+    parser.add_argument(
+        "--pose_text_replace_instruction",
+        action="store_true",
+        help="Replace natural-language instruction with pose-matrix condition text.",
+    )
+    parser.add_argument(
+        "--pose_text_require_valid",
+        action="store_true",
+        help="Skip a sample if pose fields are missing or invalid when pose text is enabled.",
+    )
+    parser.add_argument(
+        "--pose_text_precision",
+        type=int,
+        default=4,
+        help="Decimal precision used to serialize pose matrices.",
+    )
+    parser.add_argument(
+        "--no_pose_text_start_image_id",
+        action="store_true",
+        help="Do not include start_image_id in the serialized pose condition text.",
     )
     
     args = parser.parse_args()
@@ -71,6 +91,23 @@ def main():
     args = get_args()
     set_seed(args.seed)
     os.makedirs(args.out_dir,exist_ok=True)
+
+    from data.data_utils import add_special_tokens
+    from data.transforms import ImageTransform
+    from inferencer import InterleaveInferencer
+    from modeling.autoencoder import load_ae
+    from modeling.bagel import (
+        BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM,
+        SiglipVisionConfig, SiglipVisionModel
+    )
+    from modeling.qwen2 import Qwen2Tokenizer
+
+    try:
+        from accelerate.big_modeling import infer_auto_device_map, load_checkpoint_and_dispatch, init_empty_weights
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to import `accelerate`. Please ensure accelerate/bitsandbytes/triton runtime is installed correctly."
+        ) from e
 
     print(f"Loading model from: {args.model_path}")
     
@@ -135,16 +172,28 @@ def main():
 
     print(f"Mode: {args.mode} (1=bf16, 2=nf4, 3=int8)")
     if args.mode == 1:
-        model = load_checkpoint_and_dispatch(
-            model,
-            checkpoint=os.path.join(model_path, "ema_merged.safetensors"),
-            device_map=device_map,
-            offload_buffers=True,
-            offload_folder="offload",
-            dtype=torch.bfloat16,
-            force_hooks=True,
-        ).eval()
+        try:
+            model = load_checkpoint_and_dispatch(
+                model,
+                checkpoint=os.path.join(model_path, "ema_merged.safetensors"),
+                device_map=device_map,
+                offload_buffers=True,
+                offload_folder="offload",
+                dtype=torch.bfloat16,
+                force_hooks=True,
+            ).eval()
+        except:
+            model = load_checkpoint_and_dispatch(
+                model,
+                checkpoint=os.path.join(model_path, "ema.safetensors"),
+                device_map=device_map,
+                offload_buffers=True,
+                offload_folder="offload",
+                dtype=torch.bfloat16,
+                force_hooks=True,
+            ).eval()
     elif args.mode == 2: # NF4
+        from accelerate.utils import BnbQuantizationConfig, load_and_quantize_model
         bnb_config = BnbQuantizationConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=False, bnb_4bit_quant_type="nf4")
         model = load_and_quantize_model(
             model, 
@@ -154,6 +203,7 @@ def main():
             offload_folder="offload",
         ).eval()
     elif args.mode == 3: # INT8
+        from accelerate.utils import BnbQuantizationConfig, load_and_quantize_model
         bnb_config = BnbQuantizationConfig(load_in_8bit=True, torch_dtype=torch.float32)
         model = load_and_quantize_model(
             model, 
@@ -202,38 +252,79 @@ def main():
                     data.append(json.loads(line))
         return data
 
+    def report_reference_stats(samples):
+        first_re = re.compile(r"\b(first|initial)\s+image\b", re.I)
+        second_re = re.compile(r"\b(second|last)\s+image\b", re.I)
+        first_cnt = 0
+        second_cnt = 0
+        neither_cnt = 0
+        for item in samples:
+            text = item.get("instruction", "")
+            has_first = bool(first_re.search(text))
+            has_second = bool(second_re.search(text))
+            if has_first:
+                first_cnt += 1
+            if has_second:
+                second_cnt += 1
+            if (not has_first) and (not has_second):
+                neither_cnt += 1
+        print(
+            f"[INFO] reference stats -> first:{first_cnt}, second/last:{second_cnt}, "
+            f"neither:{neither_cnt}, total:{len(samples)}"
+        )
+
     val_datas = read_jsonl(args.eval_json)
-    if args.idx>-1:
-        val_datas = [val_datas[args.idx]]*args.num
-    else:
-        val_datas = random.sample(val_datas,args.num)
-    
+    if args.idx > -1:
+        if args.idx >= len(val_datas):
+            raise IndexError(f"--idx={args.idx} out of range for {len(val_datas)} samples")
+        repeat_n = args.num if args.num > 0 else 1
+        val_datas = [val_datas[args.idx]] * repeat_n
+    elif args.num > 0 and args.num < len(val_datas):
+        if args.random_subset:
+            val_datas = random.sample(val_datas, args.num)
+        else:
+            val_datas = val_datas[:args.num]
+
+    report_reference_stats(val_datas)
+
         
     
     for item in tqdm(val_datas):
     
         input_images = [Image.open(os.path.join(args.image_root,image_path)).convert("RGB") for image_path in item['context']]
+        instruction = item.get("instruction", "")
+        instruction, has_pose_text = compose_instruction_with_pose(
+            instruction=instruction,
+            row=item,
+            inject_pose_text=args.inject_pose_text,
+            replace_instruction=args.pose_text_replace_instruction,
+            include_start_image_id=not args.no_pose_text_start_image_id,
+            precision=args.pose_text_precision,
+        )
+        if args.inject_pose_text and args.pose_text_require_valid and (not has_pose_text):
+            print(f"[WARN] skip id={item.get('id', 'unknown')}: pose text requested but pose fields are invalid")
+            continue
         
         # 3.2 准备参数
         # 这些参数参考了原代码中 edit_image 的默认值
         inference_hyper = dict(
             max_think_token_n=1024 if args.show_thinking else 1024,
             do_sample=args.show_thinking, # 如果开启thinking才sample，否则默认False
-            text_temperature=0.3,
+            text_temperature=args.text_temperature,
             cfg_text_scale=args.cfg_text_scale,
             cfg_img_scale=args.cfg_img_scale,
-            cfg_interval=[0.0, 1.0],  
+            cfg_interval=[args.cfg_interval_start, args.cfg_interval_end],  
             timestep_shift=3.0,
             num_timesteps=args.num_timesteps,
-            cfg_renorm_min=0.0,
-            cfg_renorm_type="text_channel",
+            cfg_renorm_min=args.cfg_renorm_min,
+            cfg_renorm_type=args.cfg_renorm_type,
         )
 
 
         # 3.3 运行推理
         input_terms = build_interleaved_inputs(
             input_images,
-            item["instruction"],
+            instruction,
             add_context_role_text=args.add_context_role_text,
         )
         output_list = inferencer.interleave_inference(

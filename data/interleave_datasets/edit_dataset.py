@@ -8,6 +8,7 @@ from PIL import Image, ImageFile, PngImagePlugin
 
 from .interleave_t2i_dataset import InterleavedBaseIterableDataset, ParquetStandardIterableDataset, JsonStandardIterableDataset
 from ..data_utils import pil_img2rgb
+from ..pose_condition import compose_instruction_with_pose
 
 Image.MAX_IMAGE_PIXELS = 200000000
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -78,10 +79,20 @@ class UnifiedSIIterableDataset(InterleavedBaseIterableDataset, JsonStandardItera
         *args,
         enable_vit_condition=True,
         add_context_role_text=False,
+        inject_pose_text=False,
+        pose_text_replace_instruction=False,
+        pose_text_require_valid=False,
+        pose_text_include_start_image_id=True,
+        pose_text_precision=4,
         **kwargs,
     ):
         self.enable_vit_condition = enable_vit_condition
         self.add_context_role_text = add_context_role_text
+        self.inject_pose_text = inject_pose_text
+        self.pose_text_replace_instruction = pose_text_replace_instruction
+        self.pose_text_require_valid = pose_text_require_valid
+        self.pose_text_include_start_image_id = pose_text_include_start_image_id
+        self.pose_text_precision = pose_text_precision
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -124,6 +135,17 @@ class UnifiedSIIterableDataset(InterleavedBaseIterableDataset, JsonStandardItera
             )
 
         instruction = row.get("instruction", "")
+        instruction, has_pose_text = compose_instruction_with_pose(
+            instruction=instruction,
+            row=row,
+            inject_pose_text=self.inject_pose_text,
+            replace_instruction=self.pose_text_replace_instruction,
+            include_start_image_id=self.pose_text_include_start_image_id,
+            precision=self.pose_text_precision,
+        )
+        if self.inject_pose_text and self.pose_text_require_valid and (not has_pose_text):
+            return {}
+
         if not isinstance(instruction, str) or len(instruction.strip()) == 0:
             return {}
         data = self._add_text(data, instruction, need_loss=False)

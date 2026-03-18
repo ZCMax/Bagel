@@ -114,8 +114,20 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
             assert 'dataset_names' in dataset_args.keys()
             dataset_names = dataset_args.pop('dataset_names')
+            jsonl_path_list_override = dataset_args.pop('jsonl_path_list_override', None)
+            if jsonl_path_list_override is not None:
+                if not isinstance(jsonl_path_list_override, list):
+                    raise ValueError(
+                        f"group '{grouped_dataset_name}': jsonl_path_list_override must be a list."
+                    )
+                if len(jsonl_path_list_override) != len(dataset_names):
+                    raise ValueError(
+                        f"group '{grouped_dataset_name}': jsonl_path_list_override length "
+                        f"({len(jsonl_path_list_override)}) must match dataset_names length "
+                        f"({len(dataset_names)})."
+                    )
             dataset_args['data_dir_list'] = []
-            for item in dataset_names:
+            for name_idx, item in enumerate(dataset_names):
                 if self.local_rank == 0:
                     print(f'Preparing Dataset {grouped_dataset_name}/{item}')
                 meta_info = DATASET_INFO[dataset_type][item]
@@ -137,10 +149,13 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
                 if 'jsonl_path' in meta_info.keys():
                     # jsonl with jpeg
+                    jsonl_path = meta_info['jsonl_path']
+                    if jsonl_path_list_override is not None:
+                        jsonl_path = jsonl_path_list_override[name_idx]
                     if 'jsonl_path_list' not in dataset_args.keys():
-                        dataset_args['jsonl_path_list'] = [meta_info['jsonl_path']]
+                        dataset_args['jsonl_path_list'] = [jsonl_path]
                     else:
-                        dataset_args['jsonl_path_list'].append(meta_info['jsonl_path'])
+                        dataset_args['jsonl_path_list'].append(jsonl_path)
 
                 if 'json_path' in meta_info.keys():
                     # jsonl with jpeg
@@ -419,10 +434,10 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
             elif item['type'] == 'vae_image':
                 image_tensor = image_tensor_list.pop(0)
-                if item['enable_cfg'] == 1 and random.random() < self.data_config.vae_cond_dropout_prob:
-                    # FIXME fix vae dropout in video2video setting.
-                    curr_rope_id += 1
-                    continue
+                # if item['enable_cfg'] == 1 and random.random() < self.data_config.vae_cond_dropout_prob:
+                #     # FIXME fix vae dropout in video2video setting.
+                #     curr_rope_id += 1
+                #     continue
 
                 # add a <|startofimage|> token
                 sequence_status['packed_text_ids'].append(self.start_of_image)

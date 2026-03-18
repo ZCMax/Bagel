@@ -16,7 +16,14 @@ DATASET_REGISTRY = {
     'refine_step_prompt':UnifiedSIIterableDataset,
     'step_prompt_onlyone':UnifiedSIIterableDataset,
     'refine_step_prompt_onlyone':UnifiedSIIterableDataset,
-    'draw_game':UnifiedSIIterableDataset
+    'step_prompt_onlyone_force':UnifiedSIIterableDataset,
+    'step_prompt_force':UnifiedSIIterableDataset,
+    'draw_game':UnifiedSIIterableDataset,
+    'rule_base_simple_2context':UnifiedSIIterableDataset,
+    'simple_2context_0310':UnifiedSIIterableDataset,
+    'complex_2context_0310':UnifiedSIIterableDataset,
+    'idswap_simple_2context_0310':UnifiedSIIterableDataset,
+    'idswap_complex_2context_0310':UnifiedSIIterableDataset,
 }
 
 
@@ -88,6 +95,22 @@ DATASET_INFO = {
 			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/step_prompt_scannet_train.jsonl',
 			'num_total_samples': 12234
         }},
+    'step_prompt_force':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/force_step_prompt_dl3dv_train.jsonl',
+			'num_total_samples': 11216
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/force_step_prompt_matterport3d_train.jsonl',
+			'num_total_samples': 5992
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/force_step_prompt_scannet_train.jsonl',
+			'num_total_samples': 12234
+        }},
     'refine_step_prompt':{
         'dl3dv': {
 			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
@@ -121,6 +144,22 @@ DATASET_INFO = {
 			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/onlyone_step_prompt_scannet_train.jsonl',
 			'num_total_samples': 7353
         }},
+    'step_prompt_onlyone_force':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/force_onlyone_step_prompt_dl3dv_train.jsonl',
+			'num_total_samples': 2732
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/force_onlyone_step_prompt_matterport3d_train.jsonl',
+			'num_total_samples': 1512
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/force_onlyone_step_prompt_scannet_train.jsonl',
+			'num_total_samples': 7353
+        }},
     'refine_step_prompt_onlyone':{
         'dl3dv': {
 			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
@@ -143,10 +182,87 @@ DATASET_INFO = {
 			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/draw_box_train.jsonl',
 			'num_total_samples': 16115
 		},
-        }
+        },
+    'rule_base_simple_2context':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/rule_base_simple_2context_dl3dv_train.jsonl',
+			'num_total_samples': 9392
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/rule_base_simple_2context_matterport3d_train.jsonl',
+			'num_total_samples': 2025
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/rule_base_simple_2context_scannet_train.jsonl',
+			'num_total_samples': 13839
+        }},
+    'simple_2context_0310':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/simple_2context_0310_dl3dv_train.jsonl',
+			'num_total_samples': 13720
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/simple_2context_0310_matterport3d_train.jsonl',
+			'num_total_samples': 2168
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/simple_2context_0310_scannet_train.jsonl',
+			'num_total_samples': 9404
+        }},
+    'complex_2context_0310':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/complex_2context_0310_dl3dv_train.jsonl',
+			'num_total_samples': 45366
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/complex_2context_0310_matterport3d_train.jsonl',
+			'num_total_samples': 13956
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/complex_2context_0310_scannet_train.jsonl',
+			'num_total_samples': 12081
+        }},
+    'idswap_simple_2context_0310':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/idswap_simple_2context_0310_dl3dv_train.jsonl',
+			'num_total_samples': 13720
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/idswap_simple_2context_0310_matterport3d_train.jsonl',
+			'num_total_samples': 2168
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/idswap_simple_2context_0310_scannet_train.jsonl',
+			'num_total_samples': 9404
+        }},
+    'idswap_complex_2context_0310':{
+        'dl3dv': {
+			'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/idswap_complex_2context_0310_dl3dv_train.jsonl',
+			'num_total_samples': 45366
+		},
+        'matterport3d':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/idswap_complex_2context_0310_matterport3d_train.jsonl',
+			'num_total_samples': 13956
+        },
+        'scannet':{
+            'data_dir': '/mnt/inspurfs/mozi_t/linjingli/UMMSpatial/data',
+			'jsonl_path': '/mnt/petrelfs/linjingli/UMM_Spatial/annotations/idswap_complex_2context_0310_scannet_train.jsonl',
+			'num_total_samples': 12081
+        }},
 
-        
-
-    
 }
 

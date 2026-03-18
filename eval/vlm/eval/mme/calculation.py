@@ -17,7 +17,7 @@ from sklearn.metrics import (accuracy_score, confusion_matrix, precision_score,
 
 parser = argparse.ArgumentParser()
 # parser.add_argument('--results_dir', default='./LaVIN', type=str)
-parser.add_argument('--out-dir', default='./', type=str)
+parser.add_argument('--out-dir', default='/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/MME', type=str)
 
 eval_type_dict = {
     'Perception': ['existence', 'count', 'position', 'color', 'posters', 'celebrity', 'scene', 'landmark', 'artwork', 'OCR'],
@@ -108,8 +108,10 @@ class calculate_metrics:
                 task_txt = os.path.join(results_dir, task_name + '.txt')
                 lines = open(task_txt, 'r').readlines()
                 chunk_lines = list(self.divide_chunks(lines)) # one image corresponds to two questions
+        
 
                 img_num = len(chunk_lines)
+                # print('len img_num', img_num)
                 task_other_ans_num = 0
                 task_score = 0
                 acc_plus_correct_num = 0
@@ -124,14 +126,15 @@ class calculate_metrics:
                         try:
                             img_name, question, gt_ans, pred_ans = img_item.split('\t')
                         except:
-                            print(img_item)
+                            # print(img_item)
                             continue
                         gt_ans = gt_ans.lower()
-                        pred_ans = pred_ans.lower()
+                        pred_ans = pred_ans.replace('<answer>','').replace('</answer>','').lower().replace('<|im_start|>', '').replace('assistant','').replace(':', '').strip()
 
                         assert gt_ans in ['yes', 'no'] # gt can only be yes or no.
 
                         pred_ans = self.parse_pred_ans(pred_ans)
+                     
                         assert pred_ans in ['yes', 'no', 'other']
 
                         gts.append(gt_ans)
@@ -145,7 +148,8 @@ class calculate_metrics:
 
                     if img_correct_num == 2:
                         acc_plus_correct_num += 1
-
+                # print('gts', gts)
+                # print('preds', preds)
                 # cal TP precision acc, etc.
                 metric_dict = self.compute_metric(gts, preds)
                 acc_plus = acc_plus_correct_num / img_num
@@ -175,7 +179,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     # results_dir = args.results_dir
-    results_dir = args.out_dir
+    results_dir ='/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/MME'
     ret_message = cal.process_result(results_dir)
 
     writer = open(os.path.join(args.out_dir, "results.txt"), 'w')

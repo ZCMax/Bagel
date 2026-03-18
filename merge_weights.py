@@ -55,56 +55,60 @@ def merge_models(base_path, ft_path, output_path):
     print("🎉 所有工作完成！现在可以用这个文件进行推理了。")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Merge finetuned partial weights with official base weights.")
     
+    
+    for default_path in os.listdir('/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints'):
+        if '2context_0310_3data' not in default_path:
+            continue
 
-    default_path  = 'step_mix0227/0015000'
-    name = default_path.replace('/','_')
-    # 你的官方 ema.safetensors 路径 (也就是你下载的那个完整模型)
-    parser.add_argument("--base_model", default = "/mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT/ema.safetensors",type=str, help="Path to the official base ema.safetensors")
-    
-    # 你训练出来的 checkpoints/.../ema.safetensors
-    parser.add_argument("--ft_model", default = f"/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints/{default_path}/ema.safetensors",type=str, help="Path to your finetuned ema.safetensors")
-    
-    # 输出路径
-    parser.add_argument("--output", type=str, default=f"/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/{name}/ema_merged.safetensors", help="Path to save the merged model")
-    
-    args = parser.parse_args()
-    
-    merge_models(args.base_model, args.ft_model, args.output)
-    
+        default_path  = f'{default_path}/0030000'
+        name = default_path.replace('/','_')
+        # 你的官方 ema.safetensors 路径 (也就是你下载的那个完整模型)
+        parser = argparse.ArgumentParser(description="Merge finetuned partial weights with official base weights.")
+        parser.add_argument("--base_model", default = "/mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT/ema.safetensors",type=str, help="Path to the official base ema.safetensors")
         
-    # 定义源路径和目标路径
-    surrage_path = '/mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT'
-    new_path = f"/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/{name}"
-
-    # 确保目标目录存在
-    os.makedirs(new_path, exist_ok=True)
-
-    # 要复制的文件列表
-    files_to_copy = [
-        'ae.safetensors',
-        'vit_config.json',
-        'llm_config.json',
-        'tokenizer.json',
-        'vocab.json',
-        'tokenizer_config.json',
-        'preprocessor_config.json',
-        'config.json',
-        'merges.txt'
-    ]
-
-    # 复制每个文件
-    for file_name in files_to_copy:
-        source_file = os.path.join(surrage_path, file_name)
-        destination_file = os.path.join(new_path, file_name)
+        # 你训练出来的 checkpoints/.../ema.safetensors
+        parser.add_argument("--ft_model", default = f"/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/train_checkpoints/{default_path}/ema.safetensors",type=str, help="Path to your finetuned ema.safetensors")
         
-        try:
-            shutil.copy2(source_file, destination_file)
-            print(f"已成功复制: {file_name}")
-        except FileNotFoundError:
-            print(f"警告: 源文件不存在: {file_name}")
-        except Exception as e:
-            print(f"复制文件 {file_name} 时出错: {e}")
+        # 输出路径
+        parser.add_argument("--output", type=str, default=f"/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/{name}/ema_merged.safetensors", help="Path to save the merged model")
+        
+        args = parser.parse_args()
+        
+        merge_models(args.base_model, args.ft_model, args.output)
+        
+            
+        # 定义源路径和目标路径
+        surrage_path = '/mnt/inspurfs/mozi_t/linjingli/bagel/BAGEL-7B-MoT'
+        new_path = f"/mnt/petrelfs/linjingli/UMM_Spatial/bagel/results/ft_weights/{name}"
 
-    print(f"\n文件复制完成！目标目录: {new_path}")
+        # 确保目标目录存在
+        os.makedirs(new_path, exist_ok=True)
+
+        # 要复制的文件列表
+        files_to_copy = [
+            'ae.safetensors',
+            'vit_config.json',
+            'llm_config.json',
+            'tokenizer.json',
+            'vocab.json',
+            'tokenizer_config.json',
+            'preprocessor_config.json',
+            'config.json',
+            'merges.txt'
+        ]
+
+        # 复制每个文件
+        for file_name in files_to_copy:
+            source_file = os.path.join(surrage_path, file_name)
+            destination_file = os.path.join(new_path, file_name)
+            
+            try:
+                shutil.copy2(source_file, destination_file)
+                print(f"已成功复制: {file_name}")
+            except FileNotFoundError:
+                print(f"警告: 源文件不存在: {file_name}")
+            except Exception as e:
+                print(f"复制文件 {file_name} 时出错: {e}")
+
+        print(f"\n文件复制完成！目标目录: {new_path}")

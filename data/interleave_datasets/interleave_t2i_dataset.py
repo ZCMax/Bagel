@@ -286,6 +286,13 @@ class JsonStandardIterableDataset(DistributedIterableDataset):
                         "data_indexes": row_idx,
                         "worker_id": worker_id,
                         "dataset_name": self.dataset_name,
+                        # Prefer stable id alignment for auxiliary banks (e.g., geo_aux).
+                        # Fallback to row_idx if json row has no explicit id.
+                        "sample_id": (
+                            data_item.get("id", None)
+                            if isinstance(data_item, dict)
+                            else None
+                        ),
                     }                    
                 except Exception as e:
                     print(f"Error processing row {row_idx}: {e}")

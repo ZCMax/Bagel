@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import json
 import os
 import wandb
 import yaml
@@ -13,6 +14,8 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
@@ -37,6 +40,29 @@ from train.fsdp_utils import (
     FSDPCheckpoint, FSDPConfig, grad_checkpoint_check_fn, fsdp_wrapper, 
     fsdp_ema_setup, fsdp_ema_update,
 )
+from train.spatial_distill import (
+    SpatialDistillAdapter,
+    TeacherFeatureBank,
+    compute_alignment_loss,
+    pool_mse_preds_by_sample,
+)
+from train.pose_aux import (
+    PoseAuxHead,
+    PoseDeltaBank,
+    PoseProbeBuffer,
+    compute_pose_aux_loss,
+    evaluate_pose_linear_probe,
+)
+from train.geo_aux import (
+    GeoAuxBank,
+    GeoPoseHead,
+    GeoDepthHead,
+    split_tokens_by_hw,
+    unpatchify_latent_tokens,
+    se3_l1_pose_loss,
+    scale_invariant_log_depth_loss,
+    reprojection_consistency_loss,
+)
 from torchvision.utils import save_image
 
 
@@ -48,6 +74,150 @@ def _to_hashable_index(index_obj):
     if isinstance(index_obj, dict):
         return tuple(sorted((k, _to_hashable_index(v)) for k, v in index_obj.items()))
     return index_obj
+
+
+def _build_geo_image_mapping(
+    num_context: torch.Tensor,
+    source_idx: torch.Tensor,
+    patchified_vae_latent_shapes,
+):
+    """
+    Build per-sample source/target image indices in `padded_images`:
+      [context_0, ..., context_{k-1}, target]
+    """
+    src_img_indices = []
+    tgt_img_indices = []
+    tgt_hw_list = []
+    offset = 0
+
+    for nctx_t, sidx_t in zip(num_context.tolist(), source_idx.tolist()):
+        nctx = int(max(nctx_t, 0))
+        if nctx == 0:
+            return None, None, None
+        sidx = int(max(0, min(int(sidx_t), nctx - 1)))
+        src_idx_global = offset + sidx
+        tgt_idx_global = offset + nctx
+        if tgt_idx_global >= len(patchified_vae_latent_shapes):
+            return None, None, None
+        src_img_indices.append(src_idx_global)
+        tgt_img_indices.append(tgt_idx_global)
+        tgt_hw_list.append(patchified_vae_latent_shapes[tgt_idx_global])
+        offset += nctx + 1
+
+    if offset != len(patchified_vae_latent_shapes):
+        return None, None, None
+    return src_img_indices, tgt_img_indices, tgt_hw_list
+
+
+def _run_geo_aux_startup_selfcheck(
+    train_dataset,
+    geo_aux_bank: GeoAuxBank,
+    logger,
+    rank: int,
+    max_samples_per_group: int = 256,
+    strict: bool = True,
+):
+    if max_samples_per_group <= 0:
+        logger.info("[GeoAuxSelfCheck] skip: max_samples_per_group <= 0")
+        return
+
+    train_group_names = [dataset.dataset_name for dataset in train_dataset.grouped_datasets]
+    bank_group_names = set(geo_aux_bank.sample_id_to_row.keys())
+
+    extra_bank_groups = sorted(bank_group_names - set(train_group_names))
+    if len(extra_bank_groups) > 0:
+        logger.info(
+            "[GeoAuxSelfCheck][rank=%d] bank contains groups not used by this rank: %s",
+            rank,
+            ",".join(extra_bank_groups),
+        )
+
+    has_failure = False
+    for dataset in train_dataset.grouped_datasets:
+        dataset_name = dataset.dataset_name
+        sample_id_map = geo_aux_bank.sample_id_to_row.get(dataset_name)
+        if sample_id_map is None:
+            logger.warning(
+                "[GeoAuxSelfCheck][rank=%d] dataset=%s not found in geo bank; "
+                "geo losses for this dataset will be invalid.",
+                rank,
+                dataset_name,
+            )
+            continue
+
+        data_paths = getattr(dataset, "data_paths_per_rank", None)
+        if data_paths is None:
+            data_paths = getattr(dataset, "data_paths", None)
+        if data_paths is None:
+            logger.warning(
+                "[GeoAuxSelfCheck][rank=%d] dataset=%s has no data_paths for probing.",
+                rank,
+                dataset_name,
+            )
+            continue
+
+        checked = 0
+        probed = 0
+        matched = 0
+        missing_id = 0
+        missing_in_bank = 0
+        parse_error = 0
+        non_json = 0
+
+        for item in data_paths:
+            if probed >= max_samples_per_group:
+                break
+            probed += 1
+            if not isinstance(item, tuple) or len(item) == 0 or not isinstance(item[0], str):
+                non_json += 1
+                continue
+            line = item[0]
+            try:
+                row = json.loads(line)
+            except Exception:
+                parse_error += 1
+                continue
+            if not isinstance(row, dict):
+                parse_error += 1
+                continue
+
+            checked += 1
+            sample_id = row.get("id", row.get("sample_id", row.get("uid")))
+            if sample_id is None:
+                missing_id += 1
+                continue
+            if str(sample_id) in sample_id_map:
+                matched += 1
+            else:
+                missing_in_bank += 1
+
+        valid_checked = max(checked - missing_id, 0)
+        match_ratio = float(matched) / float(max(valid_checked, 1))
+        logger.info(
+            "[GeoAuxSelfCheck][rank=%d] dataset=%s checked=%d matched=%d "
+            "missing_id=%d missing_in_bank=%d parse_error=%d non_json=%d bank_size=%d "
+            "match_ratio=%.4f probed=%d",
+            rank,
+            dataset_name,
+            checked,
+            matched,
+            missing_id,
+            missing_in_bank,
+            parse_error,
+            non_json,
+            len(sample_id_map),
+            match_ratio,
+            probed,
+        )
+
+        if strict and (missing_id > 0 or missing_in_bank > 0):
+            has_failure = True
+
+    if strict and has_failure:
+        raise RuntimeError(
+            "geo_aux startup self-check failed: sample_id alignment mismatch detected. "
+            "Please regenerate geo bank with updated precompute_geo_bank.py and ensure json rows contain stable `id`."
+        )
 
 
 def save_images_png(
@@ -441,6 +611,182 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable FLEX (flash-ext friendly) packing algorithm for sequence data."}
     )
+    spatial_distill_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable optional spatial distillation loss from precomputed teacher features."}
+    )
+    spatial_distill_manifest: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to feature-bank manifest.json generated by precompute_vggt_features.py."}
+    )
+    spatial_distill_weight: float = field(
+        default=0.05,
+        metadata={"help": "Weight for the auxiliary spatial distillation loss."}
+    )
+    spatial_distill_loss_type: str = field(
+        default="cosine",
+        metadata={"help": "Distillation loss type: cosine or mse."}
+    )
+    spatial_distill_hidden_dim: int = field(
+        default=0,
+        metadata={"help": "Hidden size for the distillation adapter MLP. 0 means single linear layer."}
+    )
+    spatial_distill_lr: float = field(
+        default=1e-4,
+        metadata={"help": "Learning rate for the distillation adapter optimizer."}
+    )
+    pose_aux_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable optional pose-delta auxiliary supervision."}
+    )
+    pose_aux_manifest: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pose bank manifest.json generated by precompute_pose_delta_bank.py."}
+    )
+    pose_aux_weight: float = field(
+        default=0.05,
+        metadata={"help": "Weight for pose auxiliary loss."}
+    )
+    pose_aux_warmup_steps: int = field(
+        default=3000,
+        metadata={"help": "Linear warmup steps for pose auxiliary loss weight."}
+    )
+    pose_aux_loss_type: str = field(
+        default="smooth_l1",
+        metadata={"help": "Pose auxiliary loss type: smooth_l1 or mse."}
+    )
+    pose_aux_hidden_dim: int = field(
+        default=1024,
+        metadata={"help": "Hidden dimension for pose auxiliary head."}
+    )
+    pose_aux_lr: float = field(
+        default=1e-4,
+        metadata={"help": "Learning rate for pose auxiliary head optimizer."}
+    )
+    pose_aux_trans_norm: float = field(
+        default=1.0,
+        metadata={"help": "Translation normalization factor for pose labels."}
+    )
+    pose_aux_trans_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight of translation term inside pose loss."}
+    )
+    pose_aux_rot_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight of rotation term inside pose loss."}
+    )
+    pose_aux_smooth_l1_beta: float = field(
+        default=1.0,
+        metadata={"help": "Beta for smooth_l1 pose loss."}
+    )
+    pose_probe_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable periodic frozen-feature pose probe evaluation (for geometry learning diagnostics)."}
+    )
+    pose_probe_manifest: Optional[str] = field(
+        default=None,
+        metadata={"help": "Pose bank manifest for probe evaluation. If not set, reuse pose_aux_manifest."}
+    )
+    pose_probe_every: int = field(
+        default=1000,
+        metadata={"help": "Run pose probe every N optimizer steps."}
+    )
+    pose_probe_min_samples: int = field(
+        default=512,
+        metadata={"help": "Minimum buffered valid samples required before running probe."}
+    )
+    pose_probe_max_samples: int = field(
+        default=4096,
+        metadata={"help": "Max number of recent samples kept in probe buffer per rank."}
+    )
+    pose_probe_val_ratio: float = field(
+        default=0.2,
+        metadata={"help": "Validation split ratio for linear probe evaluation."}
+    )
+    pose_probe_ridge: float = field(
+        default=1e-4,
+        metadata={"help": "Ridge coefficient for closed-form linear probe."}
+    )
+    pose_probe_seed: int = field(
+        default=3407,
+        metadata={"help": "Random seed used for train/val split in pose probe."}
+    )
+    geo_aux_enable: bool = field(
+        default=False,
+        metadata={"help": "Enable geometry closed-loop auxiliary losses (reprojection + pose + depth)."}
+    )
+    geo_aux_manifest: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to geometry aux manifest generated by precompute_geo_bank.py."}
+    )
+    geo_aux_weight: float = field(
+        default=0.05,
+        metadata={"help": "Weight alpha for reprojection consistency loss L_geo."}
+    )
+    geo_pose_weight: float = field(
+        default=0.05,
+        metadata={"help": "Weight beta for pose regression loss L_pose."}
+    )
+    geo_depth_weight: float = field(
+        default=0.05,
+        metadata={"help": "Weight theta for depth multi-task loss L_depth."}
+    )
+    geo_aux_warmup_steps: int = field(
+        default=3000,
+        metadata={"help": "Linear warmup steps for geometry auxiliary weights."}
+    )
+    geo_pose_hidden_dim: int = field(
+        default=512,
+        metadata={"help": "Hidden size for geometry pose head."}
+    )
+    geo_depth_hidden_dim: int = field(
+        default=256,
+        metadata={"help": "Hidden size for geometry depth head."}
+    )
+    geo_aux_lr: float = field(
+        default=1e-4,
+        metadata={"help": "Learning rate for geometry auxiliary heads."}
+    )
+    geo_ssim_weight: float = field(
+        default=0.3,
+        metadata={"help": "Weight of SSIM term inside reprojection photometric loss."}
+    )
+    geo_depth_si_lambda: float = field(
+        default=0.5,
+        metadata={"help": "Scale-invariant depth loss lambda term."}
+    )
+    geo_depth_tol: float = field(
+        default=0.05,
+        metadata={"help": "Depth consistency tolerance ratio for reprojection visibility filtering."}
+    )
+    geo_reproj_max_samples: int = field(
+        default=1,
+        metadata={"help": "Max number of samples per packed batch used for reprojection loss (memory control)."}
+    )
+    geo_decode_scale: float = field(
+        default=1.0,
+        metadata={"help": "Optional latent downscale factor before VAE decode for reprojection branch. <=1.0."}
+    )
+    geo_aux_head_bf16: bool = field(
+        default=True,
+        metadata={"help": "Cast geo pose/depth auxiliary heads to bfloat16 to reduce memory."}
+    )
+    geo_startup_selfcheck: bool = field(
+        default=True,
+        metadata={"help": "Run startup sample_id alignment self-check for geo_aux before training loop."}
+    )
+    geo_startup_selfcheck_samples: int = field(
+        default=256,
+        metadata={"help": "Number of rank-local json samples per grouped dataset to probe in geo startup self-check."}
+    )
+    geo_startup_selfcheck_strict: bool = field(
+        default=True,
+        metadata={"help": "If True, abort training when geo startup self-check finds missing/misaligned sample_id."}
+    )
+    geo_require_vae_no_dropout: bool = field(
+        default=True,
+        metadata={"help": "Require vae_cond_dropout_prob=0 when geo aux is enabled (recommended for stable mapping)."}
+    )
 
 
 def main():
@@ -615,6 +961,208 @@ def main():
         for name, param in model.named_parameters():
             print(name, param.requires_grad)
 
+    # Optional spatial distillation branch (kept separate from base model path).
+    distill_feature_bank = None
+    distill_adapter = None
+    distill_optimizer = None
+    distill_last_grad_norm = torch.tensor(0.0, device=device)
+    if training_args.spatial_distill_enable:
+        if not training_args.visual_gen:
+            raise ValueError("spatial_distill requires visual_gen=True.")
+        if training_args.spatial_distill_manifest is None:
+            raise ValueError("Please set --spatial_distill_manifest when --spatial_distill_enable is True.")
+        if training_args.spatial_distill_loss_type not in {"cosine", "mse"}:
+            raise ValueError("--spatial_distill_loss_type must be one of: cosine, mse")
+
+        distill_feature_bank = TeacherFeatureBank(training_args.spatial_distill_manifest)
+        distill_adapter = SpatialDistillAdapter(
+            student_dim=model.patch_latent_dim,
+            teacher_dim=distill_feature_bank.feature_dim,
+            hidden_dim=training_args.spatial_distill_hidden_dim,
+        ).to(device)
+        distill_adapter = DDP(
+            distill_adapter,
+            device_ids=[device],
+            output_device=device,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+        distill_optimizer = torch.optim.AdamW(
+            distill_adapter.parameters(),
+            lr=training_args.spatial_distill_lr,
+            betas=(training_args.beta1, training_args.beta2),
+            eps=training_args.eps,
+            weight_decay=0,
+        )
+
+        if resume_from is not None:
+            distill_state_path = os.path.join(resume_from, "spatial_distill.pt")
+            if os.path.exists(distill_state_path):
+                state = torch.load(distill_state_path, map_location="cpu")
+                if "adapter" in state:
+                    distill_adapter.module.load_state_dict(state["adapter"], strict=True)
+                if (not resume_model_only) and ("optimizer" in state) and state["optimizer"] is not None:
+                    distill_optimizer.load_state_dict(state["optimizer"])
+                logger.info(f"Loaded spatial distill state from: {distill_state_path}")
+            else:
+                logger.warning(f"Spatial distill is enabled, but no state found at: {distill_state_path}")
+
+    pose_aux_delta_bank = None
+    pose_probe_delta_bank = None
+    pose_probe_buffer = None
+    pose_probe_last_metrics = {}
+    pose_aux_head = None
+    pose_aux_optimizer = None
+    pose_aux_last_grad_norm = torch.tensor(0.0, device=device)
+    if training_args.pose_aux_enable:
+        if not training_args.visual_gen:
+            raise ValueError("pose_aux requires visual_gen=True.")
+        if training_args.pose_aux_manifest is None:
+            raise ValueError("Please set --pose_aux_manifest when --pose_aux_enable is True.")
+        if training_args.pose_aux_loss_type not in {"smooth_l1", "mse"}:
+            raise ValueError("--pose_aux_loss_type must be one of: smooth_l1, mse")
+        if training_args.pose_aux_trans_norm <= 0:
+            raise ValueError("--pose_aux_trans_norm must be > 0")
+
+        pose_aux_delta_bank = PoseDeltaBank(training_args.pose_aux_manifest)
+        pose_aux_head = PoseAuxHead(
+            student_dim=model.patch_latent_dim,
+            hidden_dim=training_args.pose_aux_hidden_dim,
+            out_dim=6,
+        ).to(device)
+        pose_aux_head = DDP(
+            pose_aux_head,
+            device_ids=[device],
+            output_device=device,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+        pose_aux_optimizer = torch.optim.AdamW(
+            pose_aux_head.parameters(),
+            lr=training_args.pose_aux_lr,
+            betas=(training_args.beta1, training_args.beta2),
+            eps=training_args.eps,
+            weight_decay=0,
+        )
+
+        if resume_from is not None:
+            pose_state_path = os.path.join(resume_from, "pose_aux.pt")
+            if os.path.exists(pose_state_path):
+                state = torch.load(pose_state_path, map_location="cpu")
+                if "head" in state:
+                    pose_aux_head.module.load_state_dict(state["head"], strict=True)
+                if (not resume_model_only) and ("optimizer" in state) and state["optimizer"] is not None:
+                    pose_aux_optimizer.load_state_dict(state["optimizer"])
+                logger.info(f"Loaded pose aux state from: {pose_state_path}")
+            else:
+                logger.warning(f"Pose aux is enabled, but no state found at: {pose_state_path}")
+
+    if training_args.pose_probe_enable:
+        if not training_args.visual_gen:
+            raise ValueError("pose_probe requires visual_gen=True.")
+        if training_args.pose_probe_every <= 0:
+            raise ValueError("--pose_probe_every must be > 0")
+        if training_args.pose_probe_min_samples <= 0:
+            raise ValueError("--pose_probe_min_samples must be > 0")
+        if training_args.pose_probe_max_samples <= 0:
+            raise ValueError("--pose_probe_max_samples must be > 0")
+        if training_args.pose_probe_ridge < 0:
+            raise ValueError("--pose_probe_ridge must be >= 0")
+        if not (0.0 < training_args.pose_probe_val_ratio < 1.0):
+            raise ValueError("--pose_probe_val_ratio must be in (0, 1)")
+
+        probe_manifest = training_args.pose_probe_manifest or training_args.pose_aux_manifest
+        if probe_manifest is None:
+            raise ValueError(
+                "Please set --pose_probe_manifest, or provide --pose_aux_manifest for reuse."
+            )
+        pose_probe_delta_bank = PoseDeltaBank(probe_manifest)
+        pose_probe_buffer = PoseProbeBuffer(max_samples=training_args.pose_probe_max_samples)
+        logger.info(
+            f"Pose probe enabled: manifest={probe_manifest}, "
+            f"every={training_args.pose_probe_every}, "
+            f"min_samples={training_args.pose_probe_min_samples}, "
+            f"max_samples={training_args.pose_probe_max_samples}."
+        )
+
+    geo_aux_bank = None
+    geo_pose_head = None
+    geo_depth_head = None
+    geo_aux_optimizer = None
+    geo_aux_last_grad_norm = torch.tensor(0.0, device=device)
+    if training_args.geo_aux_enable:
+        if not training_args.visual_gen:
+            raise ValueError("geo_aux requires visual_gen=True.")
+        if training_args.geo_aux_manifest is None:
+            raise ValueError("Please set --geo_aux_manifest when --geo_aux_enable is True.")
+        if training_args.geo_aux_warmup_steps <= 0:
+            raise ValueError("--geo_aux_warmup_steps must be > 0")
+        if training_args.geo_aux_lr <= 0:
+            raise ValueError("--geo_aux_lr must be > 0")
+        if training_args.geo_depth_tol <= 0:
+            raise ValueError("--geo_depth_tol must be > 0")
+        if training_args.geo_reproj_max_samples < 0:
+            raise ValueError("--geo_reproj_max_samples must be >= 0")
+        if not (0.0 < training_args.geo_decode_scale <= 1.0):
+            raise ValueError("--geo_decode_scale must be in (0, 1]")
+        if training_args.geo_startup_selfcheck and training_args.geo_startup_selfcheck_samples <= 0:
+            raise ValueError("--geo_startup_selfcheck_samples must be > 0 when geo_startup_selfcheck is enabled")
+        # if training_args.geo_require_vae_no_dropout and model_args.vae_cond_dropout_prob > 0:
+        #     raise ValueError(
+        #         "geo_aux requires stable source/target image indexing. "
+        #         "Please set --vae_cond_dropout_prob 0 (or set --geo_require_vae_no_dropout False)."
+        #     )
+
+        geo_aux_bank = GeoAuxBank(training_args.geo_aux_manifest)
+        # Pose head consumes pooled source/generated latent features + their difference (3 * z_channels).
+        geo_pose_in_dim = model.latent_channel * 3
+        geo_head_dtype = torch.bfloat16 if training_args.geo_aux_head_bf16 else torch.float32
+        geo_pose_head = GeoPoseHead(
+            in_dim=geo_pose_in_dim,
+            hidden_dim=training_args.geo_pose_hidden_dim,
+            out_dim=6,
+        ).to(device=device, dtype=geo_head_dtype)
+        geo_depth_head = GeoDepthHead(
+            in_dim=model.patch_latent_dim,
+            hidden_dim=training_args.geo_depth_hidden_dim,
+        ).to(device=device, dtype=geo_head_dtype)
+        geo_pose_head = DDP(
+            geo_pose_head,
+            device_ids=[device],
+            output_device=device,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+        geo_depth_head = DDP(
+            geo_depth_head,
+            device_ids=[device],
+            output_device=device,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+        geo_aux_params = list(geo_pose_head.parameters()) + list(geo_depth_head.parameters())
+        geo_aux_optimizer = torch.optim.AdamW(
+            geo_aux_params,
+            lr=training_args.geo_aux_lr,
+            betas=(training_args.beta1, training_args.beta2),
+            eps=training_args.eps,
+            weight_decay=0,
+        )
+
+        if resume_from is not None:
+            geo_state_path = os.path.join(resume_from, "geo_aux.pt")
+            if os.path.exists(geo_state_path):
+                state = torch.load(geo_state_path, map_location="cpu")
+                if "pose_head" in state:
+                    geo_pose_head.module.load_state_dict(state["pose_head"], strict=True)
+                if "depth_head" in state:
+                    geo_depth_head.module.load_state_dict(state["depth_head"], strict=True)
+                if (not resume_model_only) and ("optimizer" in state) and state["optimizer"] is not None:
+                    geo_aux_optimizer.load_state_dict(state["optimizer"])
+                logger.info(f"Loaded geo aux state from: {geo_state_path}")
+            else:
+                logger.warning(f"Geo aux is enabled, but no state found at: {geo_state_path}")
+
     # Setup optimizer and scheduler
     optimizer = torch.optim.AdamW(
         fsdp_model.parameters(), 
@@ -679,6 +1227,15 @@ def main():
         data_status=data_status,
     )
     train_dataset.set_epoch(data_args.data_seed)
+    if training_args.geo_aux_enable and training_args.geo_startup_selfcheck:
+        _run_geo_aux_startup_selfcheck(
+            train_dataset=train_dataset,
+            geo_aux_bank=geo_aux_bank,
+            logger=logger,
+            rank=dist.get_rank(),
+            max_samples_per_group=int(training_args.geo_startup_selfcheck_samples),
+            strict=bool(training_args.geo_startup_selfcheck_strict),
+        )
     train_loader = DataLoader(
         train_dataset,
         batch_size=1, # batch size is 1 packed dataset
@@ -702,6 +1259,12 @@ def main():
     start_time = time()
     logger.info(f"Training for {training_args.total_steps} steps, starting at {train_step}...")
     optimizer.zero_grad()
+    if distill_optimizer is not None:
+        distill_optimizer.zero_grad()
+    if pose_aux_optimizer is not None:
+        pose_aux_optimizer.zero_grad()
+    if geo_aux_optimizer is not None:
+        geo_aux_optimizer.zero_grad()
     total_norm = torch.tensor(0.0, device=device)
     token_window = 0.0
     seqlen_square_window = 0.0
@@ -750,10 +1313,18 @@ def main():
             seqlen_square_window += sample_square.item()
 
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            padded_images_for_geo = data.get("padded_images", None) if training_args.geo_aux_enable else None
             if training_args.visual_gen:
                 with torch.no_grad():
                     data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
             data['return_images'] = (curr_step+1) % current_visualization_freq == 0
+            data['return_mse_preds'] = bool(
+                training_args.spatial_distill_enable
+                or training_args.pose_aux_enable
+                or training_args.pose_probe_enable
+                or training_args.geo_aux_enable
+            )
+            data['return_mse_targets'] = bool(training_args.geo_aux_enable)
             try:
                 loss_dict, images = fsdp_model(**data)
             except RuntimeError as e:
@@ -761,7 +1332,10 @@ def main():
                     logger.error(f"CUDA OOM at step {curr_step}: {e}")
                     torch.cuda.empty_cache()
                 raise e
-        
+
+        mse_preds = loss_dict.pop("mse_preds", None)
+        mse_target_clean = loss_dict.pop("mse_target_clean", None)
+        mse_target_noise = loss_dict.pop("mse_target_noise", None)
         loss = 0
         ce = loss_dict["ce"]
         if ce is not None:
@@ -793,15 +1367,355 @@ def main():
             loss_dict["mse"] = torch.tensor(0, device=device)
             total_mse_tokens = torch.tensor(0, device=device)
 
+        need_student_feats = bool(
+            training_args.spatial_distill_enable
+            or training_args.pose_aux_enable
+            or training_args.pose_probe_enable
+        )
+        student_feats = None
+        student_valid = None
+        if need_student_feats:
+            if mse_preds is None:
+                raise RuntimeError(
+                    "Auxiliary branch enabled but `mse_preds` was not returned by model."
+                )
+            if data_indexes is not None and len(data_indexes) > 0:
+                student_feats, student_valid = pool_mse_preds_by_sample(
+                    packed_mse_preds=mse_preds,
+                    mse_loss_indexes=data['mse_loss_indexes'],
+                    sample_lens=data['sample_lens'],
+                )
+
+        if training_args.spatial_distill_enable:
+            distill_loss = torch.tensor(0.0, device=device)
+            if student_feats is not None:
+                teacher_feats, teacher_valid = distill_feature_bank.lookup_batch(
+                    batch_data_indexes=data_indexes,
+                    device=device,
+                )
+                valid_mask = student_valid & teacher_valid
+                if valid_mask.any():
+                    pred_teacher_feats = distill_adapter(student_feats[valid_mask].float())
+                    distill_loss = compute_alignment_loss(
+                        pred_teacher_features=pred_teacher_feats,
+                        teacher_features=teacher_feats[valid_mask],
+                        loss_type=training_args.spatial_distill_loss_type,
+                    )
+
+            loss_dict["distill"] = distill_loss.detach()
+            loss = loss + distill_loss * training_args.spatial_distill_weight
+
+        pose_aux_weight_current = 0.0
+        if training_args.pose_aux_enable:
+            pose_aux_loss = torch.tensor(0.0, device=device)
+            if student_feats is not None:
+                gt_pose_delta, pose_valid = pose_aux_delta_bank.lookup_batch(
+                    batch_data_indexes=data_indexes,
+                    device=device,
+                )
+                valid_mask = student_valid & pose_valid
+                if valid_mask.any():
+                    gt_pose_delta = gt_pose_delta.clone()
+                    gt_pose_delta[:, :3] = gt_pose_delta[:, :3] / training_args.pose_aux_trans_norm
+                    pred_pose_delta = pose_aux_head(student_feats.float())
+                    pose_aux_loss = compute_pose_aux_loss(
+                        pred_delta=pred_pose_delta,
+                        gt_delta=gt_pose_delta,
+                        valid_mask=valid_mask,
+                        loss_type=training_args.pose_aux_loss_type,
+                        trans_weight=training_args.pose_aux_trans_weight,
+                        rot_weight=training_args.pose_aux_rot_weight,
+                        smooth_l1_beta=training_args.pose_aux_smooth_l1_beta,
+                    )
+
+            warmup_steps = max(int(training_args.pose_aux_warmup_steps), 1)
+            pose_aux_weight_current = training_args.pose_aux_weight * min(1.0, float(curr_step + 1) / warmup_steps)
+            loss_dict["pose_aux"] = pose_aux_loss.detach()
+            loss = loss + pose_aux_loss * pose_aux_weight_current
+
+        if training_args.pose_probe_enable and student_feats is not None:
+            gt_pose_delta_probe, pose_probe_valid = pose_probe_delta_bank.lookup_batch(
+                batch_data_indexes=data_indexes,
+                device=device,
+            )
+            probe_valid_mask = student_valid & pose_probe_valid
+            if probe_valid_mask.any():
+                pose_probe_buffer.add(
+                    features=student_feats[probe_valid_mask],
+                    targets=gt_pose_delta_probe[probe_valid_mask],
+                )
+
+        geo_alpha_current = 0.0
+        geo_beta_current = 0.0
+        geo_theta_current = 0.0
+        if training_args.geo_aux_enable:
+            if mse_preds is None or mse_target_clean is None or mse_target_noise is None:
+                raise RuntimeError(
+                    "geo_aux enabled but model did not return mse_preds/mse_target_clean/mse_target_noise."
+                )
+            if padded_images_for_geo is None:
+                raise RuntimeError("geo_aux enabled but padded_images were not found in batch data.")
+
+            geo_reproj_loss = torch.tensor(0.0, device=device)
+            geo_pose_loss = torch.tensor(0.0, device=device)
+            geo_depth_loss = torch.tensor(0.0, device=device)
+
+            if data_indexes is not None and len(data_indexes) > 0:
+                geo_batch = geo_aux_bank.lookup_batch(
+                    batch_data_indexes=data_indexes,
+                    device=device,
+                )
+                geo_valid = geo_batch["valid_mask"]
+
+                src_img_indices, tgt_img_indices, tgt_hw_list = _build_geo_image_mapping(
+                    num_context=geo_batch["num_context"],
+                    source_idx=geo_batch["source_idx"],
+                    patchified_vae_latent_shapes=data["patchified_vae_latent_shapes"],
+                )
+
+                if src_img_indices is not None and tgt_img_indices is not None:
+                    pred_target_tokens = mse_target_clean + (mse_target_noise - mse_preds)
+                    expected_tokens = sum(int(h) * int(w) for h, w in tgt_hw_list)
+                    if pred_target_tokens.shape[0] == expected_tokens:
+                        pred_target_token_list = split_tokens_by_hw(pred_target_tokens, tgt_hw_list)
+                        downsample_factor = model_args.latent_patch_size * vae_config.downsample
+                        depth_hw = geo_batch["source_depth"].shape[-2:]
+                        vae_decode_dtype = next(vae_model.parameters()).dtype
+
+                        reproj_items = []
+                        pose_items = []
+                        depth_items = []
+                        valid_geo_indices = [b for b in range(len(tgt_hw_list)) if bool(geo_valid[b])]
+                        reproj_indices = set()
+                        max_reproj = int(training_args.geo_reproj_max_samples)
+                        do_reproj = max_reproj > 0 and training_args.geo_aux_weight > 0
+                        do_pose = training_args.geo_pose_weight > 0
+                        do_depth = training_args.geo_depth_weight > 0
+                        if do_reproj and len(valid_geo_indices) > 0:
+                            if len(valid_geo_indices) <= max_reproj:
+                                reproj_indices = set(valid_geo_indices)
+                            else:
+                                sampled = torch.randperm(
+                                    len(valid_geo_indices),
+                                    device=device,
+                                )[:max_reproj].tolist()
+                                reproj_indices = {valid_geo_indices[i] for i in sampled}
+                        for b in range(len(tgt_hw_list)):
+                            if not bool(geo_valid[b]):
+                                continue
+
+                            src_global_idx = int(src_img_indices[b])
+                            src_h_tok, src_w_tok = data["patchified_vae_latent_shapes"][src_global_idx]
+                            src_h = int(src_h_tok) * downsample_factor
+                            src_w = int(src_w_tok) * downsample_factor
+                            src_rgb = padded_images_for_geo[src_global_idx, :, :src_h, :src_w]
+
+                            tgt_h_tok, tgt_w_tok = tgt_hw_list[b]
+                            pred_tokens = pred_target_token_list[b]
+                            pred_latent = unpatchify_latent_tokens(
+                                tokens=pred_tokens,
+                                h=tgt_h_tok,
+                                w=tgt_w_tok,
+                                latent_patch_size=model_args.latent_patch_size,
+                                latent_channel=model.patch_latent_dim // (model_args.latent_patch_size ** 2),
+                            )
+
+                            # (b) reprojection consistency: compare generated target with reprojected source.
+                            if do_reproj and b in reproj_indices:
+                                decode_latent = pred_latent.unsqueeze(0)
+                                if training_args.geo_decode_scale < 1.0:
+                                    lat_h = decode_latent.shape[-2]
+                                    lat_w = decode_latent.shape[-1]
+                                    dec_h = max(1, int(round(lat_h * training_args.geo_decode_scale)))
+                                    dec_w = max(1, int(round(lat_w * training_args.geo_decode_scale)))
+                                    if dec_h != lat_h or dec_w != lat_w:
+                                        decode_latent = F.interpolate(
+                                            decode_latent,
+                                            size=(dec_h, dec_w),
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                if decode_latent.dtype != vae_decode_dtype:
+                                    decode_latent = decode_latent.to(dtype=vae_decode_dtype)
+                                gen_rgb = vae_model.decode(decode_latent)[0]
+                                src_rgb_rs = F.interpolate(
+                                    src_rgb.unsqueeze(0),
+                                    size=depth_hw,
+                                    mode="bilinear",
+                                    align_corners=False,
+                                )[0]
+                                gen_rgb_rs = F.interpolate(
+                                    gen_rgb.unsqueeze(0),
+                                    size=depth_hw,
+                                    mode="bilinear",
+                                    align_corners=False,
+                                )[0]
+                                reproj_i, valid_mask_i = reprojection_consistency_loss(
+                                    generated_rgb=gen_rgb_rs,
+                                    source_rgb=src_rgb_rs,
+                                    source_depth=geo_batch["source_depth"][b],
+                                    target_depth=geo_batch["target_depth"][b],
+                                    source_k=geo_batch["source_k"][b],
+                                    target_k=geo_batch["target_k"][b],
+                                    source_pose_c2w=geo_batch["source_pose"][b],
+                                    target_pose_c2w=geo_batch["target_pose"][b],
+                                    ssim_weight=training_args.geo_ssim_weight,
+                                    depth_tol=training_args.geo_depth_tol,
+                                )
+                                if valid_mask_i.any():
+                                    reproj_items.append(reproj_i)
+
+                            # (a) SE(3) pose regression from (I_source, I_generated).
+                            if do_pose:
+                                with torch.no_grad():
+                                    src_latent = vae_model.encode(src_rgb.unsqueeze(0))
+                                src_pool = src_latent.mean(dim=(2, 3))
+                                gen_pool = pred_latent.unsqueeze(0).mean(dim=(2, 3))
+                                pose_feat = torch.cat([src_pool, gen_pool, gen_pool - src_pool], dim=-1)
+                                pose_head_dtype = next(geo_pose_head.parameters()).dtype
+                                pred_delta = geo_pose_head(pose_feat.to(dtype=pose_head_dtype))
+                                gt_delta = geo_batch["pose_delta"][b : b + 1]
+                                pose_items.append(
+                                    se3_l1_pose_loss(
+                                        pred_delta=pred_delta,
+                                        gt_delta=gt_delta,
+                                        valid_mask=torch.ones((1,), device=device, dtype=torch.bool),
+                                    )
+                                )
+
+                            # (c) target depth multi-task from generated latent tokens.
+                            if do_depth:
+                                depth_head_dtype = next(geo_depth_head.parameters()).dtype
+                                pred_depth_tokens = geo_depth_head(pred_tokens.to(dtype=depth_head_dtype))
+                                pred_depth_hw = F.softplus(
+                                    pred_depth_tokens.reshape(int(tgt_h_tok), int(tgt_w_tok))
+                                ) + 1e-6
+                                gt_depth_hw = F.interpolate(
+                                    geo_batch["target_depth"][b].unsqueeze(0).unsqueeze(0),
+                                    size=(int(tgt_h_tok), int(tgt_w_tok)),
+                                    mode="nearest",
+                                ).squeeze(0).squeeze(0)
+                                depth_valid = torch.isfinite(gt_depth_hw) & (gt_depth_hw > 0)
+                                depth_items.append(
+                                    scale_invariant_log_depth_loss(
+                                        pred_depth=pred_depth_hw,
+                                        gt_depth=gt_depth_hw,
+                                        valid_mask=depth_valid,
+                                        si_lambda=training_args.geo_depth_si_lambda,
+                                    )
+                                )
+
+                        if len(reproj_items) > 0:
+                            geo_reproj_loss = torch.stack(reproj_items).mean()
+                        if len(pose_items) > 0:
+                            geo_pose_loss = torch.stack(pose_items).mean()
+                        if len(depth_items) > 0:
+                            geo_depth_loss = torch.stack(depth_items).mean()
+
+            warmup_steps = max(int(training_args.geo_aux_warmup_steps), 1)
+            warm_factor = min(1.0, float(curr_step + 1) / warmup_steps)
+            geo_alpha_current = training_args.geo_aux_weight * warm_factor
+            geo_beta_current = training_args.geo_pose_weight * warm_factor
+            geo_theta_current = training_args.geo_depth_weight * warm_factor
+
+            loss_dict["geo_reproj"] = geo_reproj_loss.detach()
+            loss_dict["geo_pose"] = geo_pose_loss.detach()
+            loss_dict["geo_depth"] = geo_depth_loss.detach()
+            loss = (
+                loss
+                + geo_reproj_loss * geo_alpha_current
+                + geo_pose_loss * geo_beta_current
+                + geo_depth_loss * geo_theta_current
+            )
+
         loss = loss / training_args.gradient_accumulation_steps
         loss.backward()
 
         if (micro_step + 1) % training_args.gradient_accumulation_steps == 0:
             total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
+            if distill_optimizer is not None:
+                distill_last_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    distill_adapter.parameters(),
+                    training_args.max_grad_norm,
+                )
+            if pose_aux_optimizer is not None:
+                pose_aux_last_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    pose_aux_head.parameters(),
+                    training_args.max_grad_norm,
+                )
+            if geo_aux_optimizer is not None:
+                geo_aux_last_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    list(geo_pose_head.parameters()) + list(geo_depth_head.parameters()),
+                    training_args.max_grad_norm,
+                )
             optimizer.step()
             scheduler.step()
             fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
             optimizer.zero_grad()
+            if distill_optimizer is not None:
+                distill_optimizer.step()
+                distill_optimizer.zero_grad()
+            if pose_aux_optimizer is not None:
+                pose_aux_optimizer.step()
+                pose_aux_optimizer.zero_grad()
+            if geo_aux_optimizer is not None:
+                geo_aux_optimizer.step()
+                geo_aux_optimizer.zero_grad()
+
+            if (
+                training_args.pose_probe_enable
+                and ((curr_step + 1) % training_args.pose_probe_every == 0)
+            ):
+                local_probe = pose_probe_buffer.get_tensors()
+                if dist.get_rank() == 0:
+                    gathered_probe = [None] * dist.get_world_size()
+                else:
+                    gathered_probe = None
+                dist.gather_object(local_probe, gathered_probe, dst=0)
+
+                if dist.get_rank() == 0:
+                    probe_features = []
+                    probe_targets = []
+                    for item in gathered_probe:
+                        if item is None:
+                            continue
+                        feats_i, targets_i = item
+                        if feats_i is None or targets_i is None:
+                            continue
+                        if feats_i.numel() == 0 or targets_i.numel() == 0:
+                            continue
+                        probe_features.append(feats_i)
+                        probe_targets.append(targets_i)
+
+                    total_probe_samples = int(sum(t.shape[0] for t in probe_targets))
+                    if total_probe_samples >= training_args.pose_probe_min_samples:
+                        merged_features = torch.cat(probe_features, dim=0)
+                        merged_targets = torch.cat(probe_targets, dim=0)
+                        probe_metrics = evaluate_pose_linear_probe(
+                            features=merged_features,
+                            pose_delta=merged_targets,
+                            val_ratio=training_args.pose_probe_val_ratio,
+                            ridge=training_args.pose_probe_ridge,
+                            seed=training_args.pose_probe_seed + curr_step,
+                        )
+                        pose_probe_last_metrics = probe_metrics
+                        logger.info(
+                            "[PoseProbe] "
+                            f"step={curr_step}, n={int(probe_metrics.get('probe_num_samples', 0))}, "
+                            f"val_rot_deg={probe_metrics.get('probe_val_rot_geodesic_deg', float('nan')):.4f}, "
+                            f"val_trans_l2={probe_metrics.get('probe_val_trans_l2', float('nan')):.4f}, "
+                            f"val_success={probe_metrics.get('probe_val_success', float('nan')):.4f}"
+                        )
+                        wandb.log(
+                            {f"pose_probe/{k}": v for k, v in probe_metrics.items()},
+                            step=curr_step,
+                        )
+                    else:
+                        logger.info(
+                            f"[PoseProbe] step={curr_step}, skip: "
+                            f"global buffered samples={total_probe_samples} < pose_probe_min_samples="
+                            f"{training_args.pose_probe_min_samples}."
+                        )
         
         # Log loss values:
         if curr_step % training_args.log_every == 0:
@@ -867,6 +1781,24 @@ def main():
             wandb_log['total_mse_tokens'] = total_mse_tokens.item()
             wandb_log['total_ce_tokens'] = total_ce_tokens.item()
             wandb_log['total_norm'] = total_norm.item()
+            if distill_optimizer is not None:
+                wandb_log['distill_adapter_grad_norm'] = distill_last_grad_norm.item()
+                wandb_log['distill_lr'] = distill_optimizer.param_groups[0]['lr']
+            if pose_aux_optimizer is not None:
+                wandb_log['pose_aux_head_grad_norm'] = pose_aux_last_grad_norm.item()
+                wandb_log['pose_aux_lr'] = pose_aux_optimizer.param_groups[0]['lr']
+                wandb_log['pose_aux_weight'] = pose_aux_weight_current
+            if geo_aux_optimizer is not None:
+                wandb_log['geo_aux_grad_norm'] = geo_aux_last_grad_norm.item()
+                wandb_log['geo_aux_lr'] = geo_aux_optimizer.param_groups[0]['lr']
+                wandb_log['geo_alpha'] = geo_alpha_current
+                wandb_log['geo_beta'] = geo_beta_current
+                wandb_log['geo_theta'] = geo_theta_current
+            if training_args.pose_probe_enable and pose_probe_buffer is not None:
+                wandb_log['pose_probe_buffer_local'] = float(pose_probe_buffer.num_samples)
+                if dist.get_rank() == 0 and len(pose_probe_last_metrics) > 0:
+                    for key, value in pose_probe_last_metrics.items():
+                        wandb_log[f'pose_probe_last/{key}'] = value
             wandb_log['total_samples'] = total_samples.item()
             wandb_log['tokens_per_sec'] = tokens_per_sec
             wandb_log['tokens_per_step'] = tokens_per_step
@@ -931,6 +1863,40 @@ def main():
                 fsdp_config=fsdp_config,
                 data_status=gather_list
             )
+            if dist.get_rank() == 0 and distill_adapter is not None:
+                distill_state = {
+                    "adapter": distill_adapter.module.state_dict(),
+                    "optimizer": distill_optimizer.state_dict() if distill_optimizer is not None else None,
+                }
+                distill_state_path = os.path.join(
+                    training_args.checkpoint_dir,
+                    f"{curr_step:07d}",
+                    "spatial_distill.pt",
+                )
+                torch.save(distill_state, distill_state_path)
+            if dist.get_rank() == 0 and pose_aux_head is not None:
+                pose_state = {
+                    "head": pose_aux_head.module.state_dict(),
+                    "optimizer": pose_aux_optimizer.state_dict() if pose_aux_optimizer is not None else None,
+                }
+                pose_state_path = os.path.join(
+                    training_args.checkpoint_dir,
+                    f"{curr_step:07d}",
+                    "pose_aux.pt",
+                )
+                torch.save(pose_state, pose_state_path)
+            if dist.get_rank() == 0 and geo_pose_head is not None and geo_depth_head is not None:
+                geo_state = {
+                    "pose_head": geo_pose_head.module.state_dict(),
+                    "depth_head": geo_depth_head.module.state_dict(),
+                    "optimizer": geo_aux_optimizer.state_dict() if geo_aux_optimizer is not None else None,
+                }
+                geo_state_path = os.path.join(
+                    training_args.checkpoint_dir,
+                    f"{curr_step:07d}",
+                    "geo_aux.pt",
+                )
+                torch.save(geo_state, geo_state_path)
             # Clear CUDA cache and force garbage collection after checkpoint to free memory
             gc.collect()
             torch.cuda.empty_cache()
@@ -973,6 +1939,40 @@ def main():
             fsdp_config=fsdp_config,
             data_status=gather_list
         )
+        if dist.get_rank() == 0 and distill_adapter is not None:
+            distill_state = {
+                "adapter": distill_adapter.module.state_dict(),
+                "optimizer": distill_optimizer.state_dict() if distill_optimizer is not None else None,
+            }
+            distill_state_path = os.path.join(
+                training_args.checkpoint_dir,
+                f"{curr_step:07d}",
+                "spatial_distill.pt",
+            )
+            torch.save(distill_state, distill_state_path)
+        if dist.get_rank() == 0 and pose_aux_head is not None:
+            pose_state = {
+                "head": pose_aux_head.module.state_dict(),
+                "optimizer": pose_aux_optimizer.state_dict() if pose_aux_optimizer is not None else None,
+            }
+            pose_state_path = os.path.join(
+                training_args.checkpoint_dir,
+                f"{curr_step:07d}",
+                "pose_aux.pt",
+            )
+            torch.save(pose_state, pose_state_path)
+        if dist.get_rank() == 0 and geo_pose_head is not None and geo_depth_head is not None:
+            geo_state = {
+                "pose_head": geo_pose_head.module.state_dict(),
+                "depth_head": geo_depth_head.module.state_dict(),
+                "optimizer": geo_aux_optimizer.state_dict() if geo_aux_optimizer is not None else None,
+            }
+            geo_state_path = os.path.join(
+                training_args.checkpoint_dir,
+                f"{curr_step:07d}",
+                "geo_aux.pt",
+            )
+            torch.save(geo_state, geo_state_path)
         # Clear CUDA cache and force garbage collection after final checkpoint
         gc.collect()
         torch.cuda.empty_cache()

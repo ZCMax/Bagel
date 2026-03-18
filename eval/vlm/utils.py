@@ -52,9 +52,12 @@ def load_model_and_tokenizer(args):
 
     tokenizer = Qwen2Tokenizer.from_pretrained(args.model_path)
     tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
-
-    model_state_dict_path = os.path.join(args.model_path, "ema.safetensors")
-    model_state_dict = load_file(model_state_dict_path, device="cpu")
+    try:
+        model_state_dict_path = os.path.join(args.model_path, "ema_merged.safetensors")
+        model_state_dict = load_file(model_state_dict_path, device="cpu")
+    except:
+        model_state_dict_path = os.path.join(args.model_path, "ema.safetensors")
+        model_state_dict = load_file(model_state_dict_path, device="cpu")
     msg = model.load_state_dict(model_state_dict, strict=False)
     print(msg)
     del model_state_dict
